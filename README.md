@@ -19,7 +19,7 @@ pciePortPerstIsrHandler (中断处理入口)
 
 ### 1. PERST 中断处理层
 
-```mermaid
+``mermaid
 graph TD
     A([PERST中断触发]) --> B[pciePortPerstIsrHandler<br/>中断入口]
     B --> C{port指针有效?}
@@ -48,438 +48,285 @@ graph TD
     P -->|否| S[<b>port->ops->init(port)</b><br/>调用端口初始化]
 ```
 
+**核心代码位置**: `pcie_ctrl/pi/tianxie/pcie_ctrl_tianxie_irq.c:632-697`
+
+**关键逻辑说明**:
+- **中断快速响应**: ISR中只做必要的寄存器读写和状态判断
+- **两种处理模式**:
+  - **直接模式** (`#ifndef USE_ISR_TASK_QUEUE`): 立即调用 `port->ops->init()` 和链路建立
+  - **队列模式** (`#ifdef USE_ISR_TASK_QUEUE`): 将事件放入队列，由后台任务 `pcieIsrBottWorkerTask` 异步处理
+- **触发模式判断**: 支持上升沿和下降沿触发，暂不支持高电平触发
+
 ---
 
 ### 2. 端口初始化层 (_pciePortInit)
 
-```mermaid
+#### 2.1 平台选择入口
+
+``mermaid
 graph TD
     S --> T[_pciePortInit<br/>根据硬件平台选择实现]
-    T --> U{硬件平台?}
+    T --> U{硬件平台宏定义?}
     
-    U -->|ASIC| V[pciePortInitASIC]
-    U -->|FPGA| W[pciePortInitFPGA]
-    U -->|EMU| X[pciePortInitEMU]
+    U -->|PS3_HARDWARE_ASIC| V[pciePortInitASIC]
+    U -->|PS3_HARDWARE_FPGA| W[pciePortInitFPGA]
+    U -->|PS3_HARDWARE_EMU| X[pciePortInitEMU]
     
-    %% ASIC流程
-    V --> V1[Step1: 检查FPGA PHY PCLK状态<br/>CMD_PORT_FPGA_PHY_PCLK_STATUS]
-    V1 --> V2[Step2: TOP_CRG时钟稳定检查]
-    V2 --> V3[Step3: 禁用LTSSM<br/>CMD_PORT_LTSSM_DISABLE]
-    V3 --> V4[Step4: Hook回调配置PCS&PMA]
-    V4 --> V5[Step5: 释放软件PERST#<br/>CMD_PORT_PERST_SOFT_RST_VALID]
-    V5 --> V6[Step6: 解除PHY复位保持<br/>CMD_PORT_APPHOLD_PHY_RST_INVALID]
-    V6 --> V7[Step7: 等待CRG状态正常<br/>CMD_PORT_CHECK_CRG_STATUS]
-    V7 --> V8[Step8: Serdes参考时钟稳定通知]
-    V8 --> V9[Step9: 重载PMA固件]
-    V9 --> V10[Step10: 配置4K寄存器<br/>CMD_PORT_4K_REG_INIT_SET]
+    V --> CommonInit
+    W --> CommonInit
+    X --> CommonInit
     
-    %% FPGA流程
-    W --> W1[Step1: 检查FPGA PHY PCLK状态]
-    W1 --> W2[Step2: TOP_CRG时钟稳定检查]
-    W2 --> W3[Step3: 禁用LTSSM]
-    W3 --> W4[Step4: 释放软件PERST#]
-    W4 --> W5[Step5: 解除PHY复位保持]
-    W5 --> W6[Step6: 等待CRG状态正常]
-    W6 --> W7[Step7: Serdes参考时钟稳定通知]
-    W7 --> W8[Step8: 配置4K寄存器]
-    W8 --> W9{是否需要FPGA特殊配置?}
-    W9 -->|是| W10[修改PROC设置<br/>CRG_CTRL_EXT寄存器]
-    W9 -->|否| W11[跳过修改]
-    W10 --> W12
-    W11 --> W12[Step9: 启动LTSSM Trace]
-    
-    %% EMU流程
-    X --> X1[Step1: TOP_CRG时钟稳定检查]
-    X1 --> X2[Step2: 禁用LTSSM]
-    X2 --> X3[Step3: 释放软件PERST#]
-    X3 --> X4[Step4: 解除PHY复位保持]
-    X4 --> X5[Step5: 等待CRG状态正常]
-    X5 --> X6[Step6: Serdes参考时钟稳定通知]
-    X6 --> X7[Step7: 配置4K寄存器]
-    
-    V10 --> Y
-    W12 --> Y
-    X7 --> Y
+    CommonInit[通用初始化流程<br/>见下方详细步骤] --> End([返回初始化结果])
 ```
 
----
+#### 2.2 通用初始化流程（提取共性操作）
 
-### 3. 4K寄存器配置详解 (CMD_PORT_4K_REG_INIT_SET)
+所有平台共享的核心步骤如下：
 
-```mermaid
+``mermaid
 graph TD
-    Y[pciePort4kRegSet] --> Y1[1. 使能DBI只读寄存器写<br/>pciePortDbiRowrSet<br/>设置DBI_RO_WR bit0=1]
+    Start[进入平台特定init函数] --> Step1{是否需要<br/>PHY PCLK检查?}
     
-    Y1 --> Y2[2. Function配置<br/>pciePort4kFunctionSet]
+    Step1 -->|ASIC/FPGA需要| CheckPhyPclk[Step1: 检查FPGA PHY PCLK状态<br/>CMD_PORT_FPGA_PHY_PCLK_STATUS<br/>等待phypclk释放]
+    Step1 -->|EMU不需要| SkipPhyPclk
     
-    Y2 --> Y3[遍历所有PF<br/>for pfId = 0 to maxPfNum]
-    Y3 --> Y4[pciePort4kMapSetPF<br/>映射到指定PF]
+    CheckPhyPclk --> Step2
+    SkipPhyPclk --> Step2[Step2: TOP_CRG时钟稳定检查<br/>确保系统时钟就绪]
     
-    Y4 --> Y5{pfId < pfNum?<br/>是否为有效PF}
+    Step2 --> Step3[Step3: 禁用LTSSM<br/>CMD_PORT_LTSSM_DISABLE<br/>设置CTRL寄存器bit31=0<br/>防止意外启动]
     
-    Y5 -->|是| Y6[设置VendorID & DeviceID<br/>pciePortDidVidSet]
-    Y6 --> Y7[设置VF DeviceID<br/>pcieSriovVfDidSet]
-    Y7 --> Y8[设置初始VF数量<br/>pcieSriovInitVFSet]
-    Y8 --> Y9[配置BAR0大小<br/>pcieBarSizeSet BAR0]
-    Y9 --> Y10[配置BAR4大小<br/>pcieBarSizeSet BAR4]
-    Y10 --> Y11[配置ROM BAR大小<br/>pcieRomBarSizeSet]
-    Y11 --> Y12[设置Class Code<br/>pcieHeaderClassCodeSet]
-    Y12 --> Y13[设置DSN序列号<br/>pcieCapDsnNumberSet]
+    Step3 --> Step4{是否有<br/>特殊配置?}
     
-    Y5 -->|否| Y14[设置无效VID/DID<br/>SXE_INVALID_VENDOR_ID]
+    Step4 -->|ASIC: PCS&PMA| HookConfig[Step4: Hook回调配置PCS&PMA<br/>待实现的外部回调]
+    Step4 -->|FPGA: PROC调整| ProcModify{是否定义<br/>PCIE_PROC_NOT_READY?}
+    Step4 -->|EMU: 无| SkipSpecial
     
-    Y13 --> Y15{还有下一个PF?}
-    Y14 --> Y15
-    Y15 -->|是| Y4
-    Y15 -->|否| Y16
+    ProcModify -->|是| ModifyProc[修改PROC设置<br/>CRG_CTRL_EXT寄存器<br/>val &= ~0x70; val |= 0x50]
+    ProcModify -->|否| SkipProc
+    ModifyProc --> Step5
+    SkipProc --> Step5
     
-    Y16[配置所有VF的MSIX BAR<br/>遍历vfId = 0 to 8*maxPfNum] --> Y17
+    HookConfig --> Step5
+    SkipSpecial --> Step5
     
-    Y17[3. Port配置<br/>pciePort4kPortSet] --> Y18[启用ECRC<br/>pciePortEcrcSet]
-    Y18 --> Y19[配置链路宽度<br/>pciePortLinkwidthSet]
-    Y19 --> Y20[配置链路速度<br/>pciePortLinkspeedSet]
-    Y20 --> Y21[禁用Upconfigure<br/>pciePortUpconfigureSet]
-    Y21 --> Y22[配置EQ行为<br/>pciePortEQBehaviorSet]
+    Step5[Step5: 释放软件PERST#<br/>CMD_PORT_PERST_SOFT_RST_VALID<br/>设置CTRL寄存器bit9=1] --> Step6
     
-    Y22 --> Y23[4. 4K私有配置<br/>pciePort4kPrivateSet]
+    Step6[Step6: 解除PHY复位保持<br/>CMD_PORT_APPHOLD_PHY_RST_INVALID<br/>设置CTRL寄存器bit28=0] --> Step7
+    
+    Step7[Step7: 等待CRG状态正常<br/>CMD_PORT_CHECK_CRG_STATUS<br/>轮询直到所有信号复位完成<br/>超时保护机制] --> Step8
+    
+    Step8{是否需要<br/>Serdes时钟通知?}
+    Step8 -->|是| SerdesNotify[Step8: Serdes参考时钟稳定通知<br/>TODO: 需要回调机制]
+    Step8 -->|否| SkipSerdes
+    
+    SerdesNotify --> Step9
+    SkipSerdes --> Step9
+    
+    Step9{是否需要<br/>PMA固件重载?}
+    Step9 -->|ASIC需要| PmaReload[Step9: 重载PMA固件<br/>ASIC特有步骤]
+    Step9 -->|FPGA/EMU不需要| SkipPma
+    
+    PmaReload --> Step10
+    SkipPma --> Step10
+    
+    Step10[Step10: 配置4K寄存器<br/>CMD_PORT_4K_REG_INIT_SET<br/>详见下一节详细展开] --> Step11
+    
+    Step11[Step11: 启动LTSSM Trace<br/>CMD_PORT_LTSSM_TRACE_START<br/>如果ltssmTraceEnable=true] --> Step12
+    
+    Step12[Step12: 调用初始化钩子<br/>CMD_PORT_CALL_HOOKS<br/>遍历并执行sInitHooks数组中的回调] --> End([init函数返回0<br/>初始化成功])
 ```
 
----
+#### 2.3 各平台差异对比
 
-### 4. LTSSM Trace 启动与钩子调用
+| 步骤 | ASIC | FPGA | EMU | 说明 |
+|------|------|------|-----|------|
+| Step1: PHY PCLK检查 | ✅ | ✅ | ❌ | ASIC/FPGA需验证物理层时钟 |
+| Step2: CRG时钟检查 | ✅ | ✅ | ✅ | 所有平台都需要 |
+| Step3: LTSSM禁用 | ✅ | ✅ | ✅ | 防止意外启动 |
+| Step4: 特殊配置 | ⚠️ PCS&PMA(Hook) | ⚠️ PROC调整 | ❌ | 平台特定配置 |
+| Step5: 释放软件PERST# | ✅ | ✅ | ✅ | 软件复位释放 |
+| Step6: 解除PHY复位 | ✅ | ✅ | ✅ | 硬件复位释放 |
+| Step7: 等待CRG状态 | ✅ | ✅ | ✅ | 轮询直到正常 |
+| Step8: Serdes时钟通知 | ⚠️ TODO | ✅ | ✅ | ASIC待实现回调 |
+| Step9: PMA固件重载 | ✅ | ❌ | ❌ | 仅ASIC需要 |
+| Step10: 4K寄存器配置 | ✅ | ✅ | ✅ | 核心配置步骤 |
+| Step11: LTSSM Trace启动 | ✅ | ✅ | ✅ | 状态跟踪 |
+| Step12: 调用Hooks | ✅ | ✅ | ✅ | 用户扩展点 |
 
-```mermaid
-graph TD
-    Y23 --> Z1[Step11: 启动LTSSM Trace<br/>CMD_PORT_LTSSM_TRACE_START]
+**符号说明**:
+- ✅: 已实现且必需
+- ⚠️: 部分实现或可选
+- ❌: 不适用
+
+#### 2.4 关键步骤详解：Step1 - PHY PCLK状态检查（增强版）
+
+**原始实现问题分析**:
+- 原超时时间固定为 1ms (`PCIE_READ_REG_TIMEOUT_CNT`)
+- 超时后直接返回 `-ETIMEDOUT`，导致初始化失败
+- 在某些场景下（如仿真环境、慢速时钟），1ms可能不足
+
+**增强方案**:
+
+```
+/**
+ * @brief 检查FPGA PHY PCLK状态（增强版，支持兼容性配置）
+ * 
+ * @param port 端口指针
+ * @param timeoutMs 最大超时时间（毫秒），默认1ms
+ * @param warnThresholdMs 警告阈值（毫秒），超过此时间打印警告但继续等待
+ * @return S32 0成功，负值失败
+ */
+S32 pciePortGetPhypclkStatus(PcieCtrlPort_s *port, 
+                              U32 timeoutMs, 
+                              U32 warnThresholdMs)
+{
+    U32 status;
+    U32 timeCnt;
+    U32 warnPrinted = 0;  // 标记是否已打印警告
     
-    Z1 --> Z2{ltssmTraceEnable<br/>是否启用?}
-    Z2 -->|是| Z3[ltssmTraceStart<br/>配置LTSSM_TRACE_CTRL寄存器<br/>设置traceNum和START位]
-    Z2 -->|否| Z4[跳过Trace启动<br/>仅记录警告日志]
+    if (!port) {
+        PCIE_CTRL_LOG(PCIE_LOG_LEVEL_ERROR, "[%s] port is NULL\n", __func__);
+        return -ENODEV;
+    }
     
-    Z3 --> Z5
-    Z4 --> Z5[Step12: 调用初始化钩子<br/>CMD_PORT_CALL_HOOKS<br/>pcieCtrlCallHooks]
+    // 参数有效性检查
+    if (timeoutMs == 0) {
+        timeoutMs = PCIE_READ_REG_TIMEOUT_CNT;  // 使用默认值
+    }
+    if (warnThresholdMs == 0 || warnThresholdMs > timeoutMs) {
+        warnThresholdMs = timeoutMs / 2;  // 默认在超时一半时警告
+    }
     
-    Z5 --> Z6[遍历sInitHooks数组<br/>执行所有注册的回调函数]
-    Z6 --> Z7[init函数返回0<br/>初始化成功]
+    // 计算循环次数
+    timeCnt = timeoutMs * 1000 / PCIE_READ_REG_TIME_INTERVAL;
+    
+    PCIE_CTRL_LOG(PCIE_LOG_LEVEL_DEBUG, 
+        "[%s] Start waiting for phypclk, timeout=%ums, warn_at=%ums\n",
+        __func__, timeoutMs, warnThresholdMs);
+    
+    while (timeCnt > 0) {
+        port->regOps->readReg(port, 4, PCIE_PORT_SPACE_CTRL_REG, 0, &status);
+        
+        if (status != PCIE_INVALID_REG_VALUE) {
+            PCIE_CTRL_LOG(PCIE_LOG_LEVEL_INFO, 
+                "[%s] phypclk released successfully after %d iterations\n", 
+                __func__, timeoutMs * 1000 / PCIE_READ_REG_TIME_INTERVAL - timeCnt);
+            return 0;
+        }
+        
+        // 检查是否达到警告阈值
+        U32 elapsedMs = (timeoutMs * 1000 / PCIE_READ_REG_TIME_INTERVAL - timeCnt) 
+                        * PCIE_READ_REG_TIME_INTERVAL / 1000;
+        
+        if (!warnPrinted && elapsedMs >= warnThresholdMs) {
+            PCIE_CTRL_LOG(PCIE_LOG_LEVEL_WARN, 
+                "[%s] WARNING: phypclk not released after %ums (threshold reached), "
+                "continuing to wait until %ums timeout\n",
+                __func__, elapsedMs, timeoutMs);
+            warnPrinted = 1;
+        }
+        
+        timeCnt--;
+        udelay(PCIE_READ_REG_TIME_INTERVAL);
+    }
+    
+    // 最终超时
+    PCIE_CTRL_LOG(PCIE_LOG_LEVEL_ERROR, 
+        "[%s] ERROR: phypclk wait timeout (%ums expired). "
+        "Last read status=0x%x (expected non-0x%lx)\n",
+        __func__, timeoutMs, status, (unsigned long)PCIE_INVALID_REG_VALUE);
+    
+    return -ETIMEDOUT;
+}
 ```
 
----
+**使用示例**:
 
-### 5. 链路建立层
+```
+// ASIC平台调用示例
+S32 pciePortInitASIC(PcieCtrlPort_s *port)
+{
+    S32 ret = 0;
+    
+    // ... 其他初始化代码 ...
+    
+    // Step1: 检查FPGA PHY PCLK状态（增强版）
+    // 配置：最大超时10ms，超过2ms时打印警告
+    ret = pciePortGetPhypclkStatus(port, 10, 2);
+    if (ret != 0) {
+        PCIE_CTRL_LOG(PCIE_LOG_LEVEL_ERROR, 
+            "[%s] pcie port get fpga phy pclk status failed, ret=%d\n", 
+            __func__, ret);
+        return ret;
+    }
+    
+    // ... 后续步骤 ...
+}
 
-```mermaid
-graph TD
-    Z7 --> AA[pcieCtrlEstablishLink<br/>建立PCIe链路]
-    AA --> AB[port->ops->set<br/>CMD_PORT_LTSSM_ENABLE]
-    AB --> AC[设置LTSSM_EN bit31=1<br/>启动链路训练]
-    AC --> AD([初始化完成<br/>等待链路训练进入L0状态])
+// EMU平台可以跳过此步骤
+S32 pciePortInitEMU(PcieCtrlPort_s *port)
+{
+    // EMU环境不需要检查phypclk
+    PCIE_CTRL_LOG(PCIE_LOG_LEVEL_INFO, 
+        "[%s] Skip phypclk check in EMU mode\n", __func__);
+    
+    // ... 直接从Step2开始 ...
+}
 ```
 
----
+**配置建议**:
 
-## 关键抽象层次总结
-
-### 📌 第一层：中断处理层 (`pciePortPerstIsrHandler`)
-**职责**: 快速响应 PERST 信号变化  
-**关键决策**: 
-- 区分 Assert(复位) 和 Deassert(释放)
-- 支持两种处理模式：
-  - **直接模式**: 立即调用 init()
-  - **队列模式**: 将事件放入队列，由后台任务处理
-
-**核心代码位置**: `/home/sam/minisoc_fw/pcie_ctrl/pi/tianxie/pcie_ctrl_tianxie_irq.c:632-697`
-
----
-
-### 📌 第二层：端口初始化层 (`_pciePortInit`)
-**职责**: 按顺序执行硬件初始化步骤  
-
-**三大平台实现**:
-1. **ASIC**: `pciePortInitASIC` - 11个步骤，包含PMA固件重载
-2. **FPGA**: `pciePortInitFPGA` - 9个步骤，包含PROC特殊配置
-3. **EMU**: `pciePortInitEMU` - 7个步骤，最简化流程
-
-**通用步骤**:
-1. ✅ 时钟检查 (TOP_CRG稳定)
-2. ✅ LTSSM控制 (先禁用，最后启用)
-3. ✅ 复位管理 (软件PERST#、PHY复位、CRG状态)
-4. ✅ 寄存器配置 (4K空间配置)
-5. ✅ Trace启动 (LTSSM状态跟踪)
-6. ✅ Hook调用 (用户自定义扩展)
-
-**核心代码位置**: `/home/sam/minisoc_fw/pcie_ctrl/pi/tianxie/pcie_ctrl_tianxie_core.c:1369-1680`
-
----
-
-### 📌 第三层：命令抽象层 (`port->ops->set/get`)
-**设计模式**: 命令表驱动 (`gPortSetCmdTable`)  
+| 场景 | timeoutMs | warnThresholdMs | 说明 |
+|------|-----------|-----------------|------|
+| **ASIC生产环境** | 10 | 2 | 允许较慢的硬件启动，提前预警 |
+| **FPGA调试环境** | 50 | 10 | FPGA时序不稳定，给予更大余量 |
+| **EMU仿真环境** | 跳过 | - | 仿真环境无需检查 |
+| **快速启动模式** | 1 | 0 | 严格超时，不打印警告 |
+| **保守模式** | 100 | 20 | 极端情况下保证成功率 |
 
 **优势**:
-- 🎯 统一接口，隐藏具体实现
-- 🔧 易于扩展新命令
-- 💡 支持两种处理器模式：
-  - `simple_handler`: 无参数处理函数
-  - `param_handler`: 带参数处理函数
-
-**命令表示例**:
-```c
-static const PcieCmdTableEntry_s gPortSetCmdTable[] = {
-    { CMD_PORT_LTSSM_DISABLE,      NULL,                    pciePortLtssmSet           },
-    { CMD_PORT_PERST_SOFT_RST_VALID, NULL,                  pciePortPersetSoftRstSet   },
-    { CMD_PORT_CHECK_CRG_STATUS,   pciePortCheckCrgStatus,  NULL                       },
-    { CMD_PORT_4K_REG_INIT_SET,    pciePort4kRegSet,        NULL                       },
-    { CMD_PORT_LTSSM_TRACE_START,  pciePortLtssmTraceStart, NULL                       },
-    { CMD_PORT_CALL_HOOKS,         pcieCtrlCallHooks,       NULL                       },
-};
-```
-
-**核心代码位置**: `/home/sam/minisoc_fw/pcie_ctrl/pi/tianxie/pcie_ctrl_tianxie_core.c:1280-1330`
-
----
-
-### 📌 第四层：4K寄存器配置层 (`pciePort4kRegSet`)
-
-这是**最复杂的抽象**，包含四个子层次：
-
-#### 4.1 DBI控制层
-- **函数**: `pciePortDbiRowrSet`
-- **作用**: 使能只读寄存器可写 (设置 `DBI_RO_WR` bit0=1)
-- **寄存器**: `SXE_PCIE_4K_DBI_RO_WR_OFFSET`
-
-#### 4.2 Function配置层 (`pciePort4kFunctionSet`)
-**遍历所有PF进行配置**:
-- ✅ VendorID/DeviceID 设置
-- ✅ SR-IOV VF配置 (初始VF数量、VF DeviceID)
-- ✅ BAR大小配置 (BAR0, BAR4, ROM BAR)
-- ✅ Class Code 设置 (网络设备类 `0x020000`)
-- ✅ DSN序列号设置
-
-**VF配置**:
-- 为每个虚拟功能配置 MSIX BAR (默认BAR4)
-- 遍历范围: `vfId = 0 to 8*maxPfNum`
-
-**核心代码位置**: `/home/sam/minisoc_fw/pcie_ctrl/pi/tianxie/pcie_ctrl_tianxie_core.c:873-990`
-
-#### 4.3 Port配置层 (`pciePort4kPortSet`)
-- ✅ **ECRC校验**: 启用端到端循环冗余校验
-- ✅ **链路宽度**: 配置最大链路宽度 (x1/x4/x8/x16)
-- ✅ **链路速度**: 配置最大链路速度 (Gen1~Gen6)
-- ✅ **Upconfigure**: 禁用动态带宽升级
-- ✅ **EQ预设**: 配置均衡器行为 (设置为0x3)
-
-**核心代码位置**: `/home/sam/minisoc_fw/pcie_ctrl/pi/tianxie/pcie_ctrl_tianxie_core.c:1126-1180`
-
-#### 4.4 私有配置层 (`pciePort4kPrivateSet`)
-- 平台特定的额外配置
-- 预留扩展点
-
----
-
-### 📌 第五层：链路建立层 (`pcieCtrlEstablishLink`)
-**最终动作**: 
-- 调用 `port->ops->set(CMD_PORT_LTSSM_ENABLE)`
-- 设置 `LTSSM_EN` 寄存器 bit31=1
-
-**结果**: 
-- 启动 PCIe 链路训练
-- 状态机流转: Detect → Polling → Configuration → L0
-
-**核心代码位置**: `/home/sam/minisoc_fw/pcie_ctrl/pi/tianxie/pcie_ctrl_tianxie_core.c:1623-1640`
-
----
-
-## 数据流图
-
-```
-应用层 (Application)
-    ↓ 调用 pcieCtrlEstablishLink()
-    
-API层 (pcie_ctrl_api.c)
-    ↓ 查找对应端口
-    ↓ 调用 port->ops->establishLink()
-    
-平台实现层 (pcie_ctrl_tianxie_core.c)
-    ↓ _pciePortEstablishLink()
-    ↓ 调用 port->ops->set(CMD_PORT_LTSSM_ENABLE)
-    
-命令分发层 (pcieCtrlPortSet)
-    ↓ 查表 gPortSetCmdTable
-    ↓ 调用 pciePortLtssmSet()
-    
-寄存器操作层 (pciePortLtssmSet)
-    ↓ 读取 CTRL 寄存器
-    ↓ 设置 bit31 = 1
-    ↓ 写回 CTRL 寄存器
-    
-硬件层 (Hardware)
-    ↓ LTSSM状态机启动
-    ↓ 开始链路训练
-```
-
----
-
-## 关键数据结构
-
-### PcieCtrlPort_s (端口结构)
-```c
-typedef struct PcieCtrlPort_s {
-    U8 portId;                        // 端口ID
-    U8 ctrlId;                        // 控制器ID
-    U32 baseAddr;                     // 端口基地址
-    PcieBifurMode_e bifurcation;      // 分叉配置
-    bool ltssmTraceEnable;            // LTSSM trace使能
-    
-    // 配置信息
-    PcieBasicId_s *basicId;           // 基础标识 (VID/DID)
-    PcieBarConfig_s *bars;            // BAR配置
-    PcieExpressCap_s *pcieCap;        // PCIe能力
-    PcieSriovConfig_s *sriov;         // SR-IOV配置
-    
-    // 操作集 (关键!)
-    const PciePortRegOps_s *regOps;   // 寄存器操作集
-    const PciePortOps_s *ops;         // 端口操作集 ← init函数在这里
-    
-    // 钩子数组
-    PcieCtrlInitHook_s sInitHooks[PCIE_MAX_INIT_HOOKS];
-} PcieCtrlPort_s;
-```
-
-### PciePortOps_s (端口操作集)
-```c
-typedef struct PciePortOps_s {
-    S32 (*init)(PcieCtrlPort_s *port);              // 初始化
-    S32 (*deInit)(PcieCtrlPort_s *port);            // 反初始化
-    S32 (*establishLink)(PcieCtrlPort_s *port);     // 建立链路
-    S32 (*stopLink)(PcieCtrlPort_s *port);          // 停止链路
-    S32 (*set)(PcieCtrlPort_s *port, U32 cmd, void *param);  // 设置命令
-    S32 (*get)(PcieCtrlPort_s *port, U32 cmd, void *param);  // 获取命令
-} PciePortOps_s;
-```
-
----
-
-## 时序图
-
-```
-时间轴 →
-
-中断触发
-    |
-    |---> pciePortPerstIsrHandler()
-    |       |---> 清中断标志
-    |       |---> 读取PERST状态
-    |       |---> 判断Deassert
-    |       |
-    |       |---> port->ops->init()  ← 关键调用
-    |               |
-    |               |---> Step1-9: 硬件初始化
-    |               |---> Step10: 4K寄存器配置
-    |               |       |---> DBI使能
-    |               |       |---> PF/VF配置
-    |               |       |---> Port配置
-    |               |       |---> 私有配置
-    |               |---> Step11: LTSSM Trace启动
-    |               |---> Step12: 调用Hooks
-    |               |
-    |               <--- 返回0 (成功)
-    |
-    |---> pcieCtrlEstablishLink()
-    |       |---> port->ops->set(LTSSM_ENABLE)
-    |       |---> 设置LTSSM_EN bit31=1
-    |
-    v
-链路训练开始 (Detect→Polling→Config→L0)
-```
-
----
-
-## 常见问题与调试技巧
-
-### ❓ 问题1: init函数失败如何定位?
-**方法**:
-1. 查看日志中哪个 Step 报错
-2. 检查返回值 `ret`
-3. 确认对应的 CMD 是否有正确的 handler
-
-### ❓ 问题2: 4K寄存器配置失败?
-**检查点**:
-1. DBI_RO_WR 是否已使能
-2. PF映射是否正确 (`pciePort4kMapSetPF`)
-3. BAR大小是否符合规范 (2的幂次)
-
-### ❓ 问题3: LTSSM无法进入L0?
-**排查步骤**:
-1. 确认 LTSSM_EN 已设置
-2. 检查链路宽度和速度配置
-3. 查看 LTSSM Trace 日志
-4. 验证对端设备是否正常
-
-### 🔧 调试技巧
-```c
-// 在关键步骤添加日志
-PCIE_CTRL_LOG(PCIE_LOG_LEVEL_INFO, 
-    "[%s] Step%d completed, ret=%d\n", __func__, step_num, ret);
-
-// GDB调试时检查端口状态
-(gdb) p *port
-(gdb) p port->status
-(gdb) p port->pcieCap->caps.maxLinkSpeed
-(gdb) p port->pcieCap->caps.maxLinkWidth
-```
+1. ✅ **向后兼容**: 默认参数保持原有1ms行为
+2. ✅ **灵活配置**: 通过参数调整适应不同场景
+3. ✅ **早期预警**: 在完全超时前打印警告，便于诊断
+4. ✅ **详细日志**: 记录实际等待时间和最终状态
+5. ✅ **容错性强**: 即使超过1ms也能继续等待，提高成功率
 
 ---
 
 ## 总结
 
-这个设计采用了**分层抽象**的架构：
+### 架构设计亮点
 
-1. **中断层**: 快速响应，最小化处理
-2. **初始化层**: 顺序执行，平台差异化
-3. **命令层**: 统一接口，表驱动分发
-4. **配置层**: 模块化配置，易于维护
-5. **链路层**: 最终使能，启动训练
+1. **分层抽象**:
+   - 中断层: 快速响应，最小化处理
+   - 初始化层: 顺序执行，平台差异化
+   - 命令层: 统一接口，表驱动分发
 
-**优势**:
-- ✅ 代码复用率高 (命令抽象层)
-- ✅ 易于扩展 (添加新CMD只需修改表)
-- ✅ 平台隔离 (ASIC/FPGA/EMU独立实现)
-- ✅ 可测试性强 (每步都有返回值检查)
-- ✅ 可维护性好 (清晰的层次和职责划分)
+2. **平台隔离**:
+   - ASIC/FPGA/EMU 独立实现，互不影响
+   - 共性操作提取到通用流程
+   - 差异操作通过条件编译或参数配置
 
-**核心文件**:
-- 中断处理: `pcie_ctrl_tianxie_irq.c`
-- 平台初始化: `pcie_ctrl_tianxie_core.c`
-- LTSSM Trace: `pcie_ctrl_tianxie_dfx.c`
-- 命令定义: `pcie_ctrl_common.h`
+3. **可扩展性**:
+   - Hook机制允许用户自定义扩展
+   - 命令表驱动易于添加新功能
+   - 超时参数化支持灵活配置
 
----
+4. **健壮性**:
+   - 每步都有返回值检查
+   - 超时保护防止无限等待
+   - 详细的日志便于问题定位
 
-## 附录：各平台初始化步骤对比
-
-| 步骤 | ASIC | FPGA | EMU | 说明 |
-|------|------|------|-----|------|
-| Step1 | ✅ PHY PCLK检查 | ✅ PHY PCLK检查 | ❌ | 确保物理层时钟就绪 |
-| Step2 | ✅ CRG时钟检查 | ✅ CRG时钟检查 | ✅ CRG时钟检查 | TOP_CRG时钟稳定 |
-| Step3 | ✅ LTSSM禁用 | ✅ LTSSM禁用 | ✅ LTSSM禁用 | 防止意外启动 |
-| Step4 | ⚠️ PCS&PMA配置(Hook) | ❌ | ❌ | ASIC特有，待实现 |
-| Step5 | ✅ 释放软件PERST# | ✅ 释放软件PERST# | ✅ 释放软件PERST# | 软件复位释放 |
-| Step6 | ✅ 解除PHY复位 | ✅ 解除PHY复位 | ✅ 解除PHY复位 | 硬件复位释放 |
-| Step7 | ✅ 等待CRG状态 | ✅ 等待CRG状态 | ✅ 等待CRG状态 | 轮询直到正常 |
-| Step8 | ⚠️ Serdes时钟通知 | ✅ Serdes时钟通知 | ✅ Serdes时钟通知 | TODO: 需要回调 |
-| Step9 | ✅ PMA固件重载 | ❌ | ❌ | ASIC特有 |
-| Step10 | ✅ 4K寄存器配置 | ✅ 4K寄存器配置 | ✅ 4K寄存器配置 | 核心配置步骤 |
-| Step10.1 | ❌ | ⚠️ PROC特殊配置 | ❌ | FPGA调试用 |
-| Step11 | ✅ LTSSM Trace启动 | ✅ LTSSM Trace启动 | ✅ LTSSM Trace启动 | 状态跟踪 |
-| Step12 | ✅ 调用Hooks | ✅ 调用Hooks | ✅ 调用Hooks | 用户扩展点 |
-
-**符号说明**:
-- ✅: 已实现
-- ⚠️: 部分实现或待完善
-- ❌: 不适用或未实现
+**核心文件索引**:
+- 中断处理: `pcie_ctrl/pi/tianxie/pcie_ctrl_tianxie_irq.c`
+- 平台初始化: `pcie_ctrl/pi/tianxie/pcie_ctrl_tianxie_core.c`
+- 命令定义: `pcie_ctrl/include/pcie_ctrl_common.h`
 
 ---
 
-**文档版本**: v1.0  
+**文档版本**: v2.0  
 **最后更新**: 2026-05-30  
-**作者**: AI Assistant  
-**适用平台**: tianxie (可扩展到其他平台)
+**变更说明**: 
+- 提取共性操作流程
+- 增强phypclk检查的兼容性
+- 简化文档结构，聚焦核心流程
